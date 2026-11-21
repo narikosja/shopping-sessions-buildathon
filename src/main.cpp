@@ -1,3 +1,4 @@
+#include "identifiers.hpp"
 #include "input.hpp"
 #include "output.hpp"
 
@@ -51,41 +52,76 @@ void parallel(size_t jobs, size_t threads, Work work) {
 
 class Links {
 public:
-    explicit Links(const std::vector<Text>& chunks) {
+    Links(const std::vector<Text>& chunks, Identifiers& identifiers) {
+        size_t bytes = 0;
+        for (const Text chunk : chunks) bytes += chunk.size();
+        aliases_.resize(std::bit_ceil(bytes / 8 + 1));
+        nodes_.reserve(bytes / 12);
         for (Text chunk : chunks) {
             csv_rows<2>(chunk, [&](const auto& row) {
                 if (row[0].empty() || row[1].empty()) return;
-                uint32_t a = root(intern(row[0]));
-                uint32_t b = root(intern(row[1]));
+                uint32_t a = root(intern(identifiers.get(row[0])));
+                uint32_t b = root(intern(identifiers.get(row[1])));
                 if (a == b) return;
                 if (nodes_[a].size < nodes_[b].size) std::swap(a, b);
                 nodes_[b].parent = a;
                 nodes_[a].size += nodes_[b].size;
-                nodes_[a].name = std::min(nodes_[a].name, nodes_[b].name);
+                if (Identifiers::byte_less(nodes_[b].name, nodes_[a].name)) {
+                    nodes_[a].name = nodes_[b].name;
+                }
             });
         }
-        for (uint32_t i = 0; i < nodes_.size(); ++i) {
-            const auto id = root(i);
-            nodes_[i].name = nodes_[id].name;
+        for (auto& alias : aliases_) {
+            if (alias.alias) alias.person = nodes_[root(alias.person)].name;
         }
+        std::vector<Node>().swap(nodes_);
     }
 
-    Text canonical(Text alias) const {
-        const auto found = ids_.find(alias);
-        return found == ids_.end() ? alias : nodes_[found->second].name;
+    Id canonical(Id alias) const {
+        size_t slot = alias_slot(alias);
+        while (aliases_[slot].alias) {
+            if (aliases_[slot].alias == alias) return aliases_[slot].person;
+            slot = next_slot(slot);
+        }
+        return alias;
     }
 
 private:
     struct Node {
         uint32_t parent;
         uint32_t size;
-        Text name;
+        Id name;
     };
 
-    uint32_t intern(Text user) {
-        auto [it, inserted] = ids_.try_emplace(user, nodes_.size());
-        if (inserted) nodes_.push_back({it->second, 1, user});
-        return it->second;
+    struct Alias {
+        Id alias = 0;
+        Id person = 0;
+    };
+
+    size_t alias_slot(Id alias) const { return mix(alias) & (aliases_.size() - 1); }
+    size_t next_slot(size_t slot) const { return (slot + 1) & (aliases_.size() - 1); }
+
+    uint32_t intern(Id user) {
+        size_t slot = alias_slot(user);
+        while (aliases_[slot].alias && aliases_[slot].alias != user) slot = next_slot(slot);
+        if (aliases_[slot].alias) return aliases_[slot].person;
+
+        if (nodes_.size() >= aliases_.size() * 3 / 4) {
+            auto previous = std::move(aliases_);
+            aliases_ = std::vector<Alias>(previous.size() * 2);
+            for (const auto& entry : previous) {
+                if (!entry.alias) continue;
+                size_t target = alias_slot(entry.alias);
+                while (aliases_[target].alias) target = next_slot(target);
+                aliases_[target] = entry;
+            }
+            slot = alias_slot(user);
+            while (aliases_[slot].alias) slot = next_slot(slot);
+        }
+        const auto index = static_cast<uint32_t>(nodes_.size());
+        aliases_[slot] = {user, index};
+        nodes_.push_back({index, 1, user});
+        return index;
     }
 
     uint32_t root(uint32_t id) {
@@ -97,8 +133,8 @@ private:
         return id;
     }
 
-    StringMap<uint32_t> ids_;
     std::vector<Node> nodes_;
+    std::vector<Alias> aliases_;
 };
 
 struct Catalogs {
@@ -121,24 +157,9 @@ struct Catalogs {
     }
 };
 
-struct User {
-    Text name;
-    uint64_t hash;
-};
-
-inline bool operator<(const User& a, const User& b) {
-    if (a.hash != b.hash) return a.hash < b.hash;
-    return a.name < b.name;
-}
-
-inline bool operator==(const User& a, const User& b) {
-    return a.hash == b.hash && a.name == b.name;
-}
-
 struct EventCandidate {
-    Text id;
-    uint64_t hash;
-    Text user;
+    Id id;
+    Id user = 0;
     int64_t ingest;
     int64_t ts = 0;
     int32_t price = 0;
@@ -146,22 +167,22 @@ struct EventCandidate {
 };
 
 struct Event {
-    User user;
+    Id user;
     int64_t ts;
     int32_t price;
     uint32_t category;
 };
 
 struct Click {
-    User user;
+    Id user;
     int64_t ts;
-    Text id;
+    Id id;
     uint32_t campaign;
 };
 
 EventCandidate parse_event(const std::array<Text, 7>& row, const Window& window,
-                           const Catalogs& catalogs) {
-    EventCandidate event{row[0], TextHash{}(row[0]), {}, iso_timestamp(row[3])};
+                           const Catalogs& catalogs, Identifiers& identifiers) {
+    EventCandidate event{identifiers.get(row[0]), 0, iso_timestamp(row[3])};
     if (row[1].empty() || row[5].empty()) return event;
     event.ts = timestamp(row[2]);
     if (event.ts < window.start || event.ts >= window.end || event.ingest - event.ts > day_ms) {
@@ -176,7 +197,7 @@ EventCandidate parse_event(const std::array<Text, 7>& row, const Window& window,
     } else if (row[4] != "view" && row[4] != "cart") {
         return event;
     }
-    event.user = row[1];
+    event.user = identifiers.get(row[1]);
     return event;
 }
 
@@ -190,24 +211,35 @@ void deduplicate(size_t shard, std::vector<EventInput>& inputs, EventPartitions&
     for (const auto& input : inputs) count += input[shard].size();
     constexpr size_t slot_shift = std::countr_zero(event_shards);
     if (count == 0) return;
-    std::vector<const EventCandidate*> slots(std::bit_ceil(count + count / 2 + 1));
+    struct Slot {
+        Id id = 0;
+        EventCandidate* row = nullptr;
+    };
+    std::vector<Slot> slots(std::bit_ceil(count + count / 2 + 1));
     const size_t mask = slots.size() - 1;
-    for (const auto& input : inputs) {
-        for (const auto& row : input[shard]) {
-            size_t i = (row.hash >> slot_shift) & mask;
-            while (slots[i] && (slots[i]->hash != row.hash || slots[i]->id != row.id)) {
-                i = (i + 1) & mask;
+    for (auto& input : inputs) {
+        for (auto& row : input[shard]) {
+            size_t i = (mix(row.id) >> slot_shift) & mask;
+            while (slots[i].id && slots[i].id != row.id) i = (i + 1) & mask;
+            auto& slot = slots[i];
+            if (!slot.id) {
+                slot = {row.id, &row};
+            } else if (row.ingest < slot.row->ingest) {
+                slot.row->user = 0;
+                slot.row = &row;
+            } else {
+                row.user = 0;
             }
-            if (!slots[i] || row.ingest < slots[i]->ingest) slots[i] = &row;
         }
     }
-    for (const auto* row : slots) {
-        if (!row || row->user.empty()) continue;
-        const Text name = links.canonical(row->user);
-        const uint64_t hash = TextHash{}(name);
-        output[hash & (person_shards - 1)].push_back({{name, hash}, row->ts, row->price, row->category});
+    for (auto& input : inputs) {
+        for (const auto& row : input[shard]) {
+            if (!row.user) continue;
+            const Id person = links.canonical(row.user);
+            output[mix(person) & (person_shards - 1)].push_back({person, row.ts, row.price, row.category});
+        }
+        std::vector<EventCandidate>().swap(input[shard]);
     }
-    for (auto& input : inputs) std::vector<EventCandidate>().swap(input[shard]);
 }
 
 using DailyCampaigns = std::unordered_map<int32_t, std::vector<CampaignDay>>;
@@ -252,13 +284,13 @@ void aggregate(const std::vector<Event>& events, const std::vector<Click>& click
     size_t click = 0;
     size_t event = 0;
     while (event < events.size()) {
-        const User user = events[event].user;
+        const Id user = events[event].user;
         while (click < clicks.size() && clicks[click].user < user) ++click;
         size_t oldest = click;
 
         do {
             const int32_t day = utc_day(events[event].ts);
-            UserDay row{user.name, day, 0, 0, 0, {}};
+            UserDay row{user, day, 0, 0, 0, {}};
             auto& daily = campaign_days.try_emplace(day, campaign_count).first->second;
             do {
                 const auto start = events[event].ts;
@@ -378,17 +410,24 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     Inputs inputs;
     const Window window = read_window(data / "manifest.json");
     const Catalogs catalogs(inputs.load(data / "products.csv"), inputs.load(data / "campaigns.csv"));
-    const Links links(inputs.chunks(data / "links"));
+    Identifiers identifiers;
+    const Links links(inputs.chunks(data / "links"), identifiers);
     const auto event_chunks = inputs.chunks(data / "events");
     const auto click_chunks = inputs.chunks(data / "clicks");
     timing.stage("Catalogs and identity links");
 
     std::vector<EventInput> parsed(threads);
+    size_t event_bytes = 0;
+    for (const auto& chunk : event_chunks) event_bytes += chunk.size();
+    const size_t initial_capacity = event_bytes / 68 / event_shards / threads;
+    for (auto& worker : parsed) {
+        for (auto& shard : worker) shard.reserve(initial_capacity);
+    }
     parallel(event_chunks.size(), threads, [&](size_t chunk, size_t worker) {
         csv_rows<7>(event_chunks[chunk], [&](const auto& row) {
             if (row[0].empty()) return;
-            auto event = parse_event(row, window, catalogs);
-            parsed[worker][event.hash & (event_shards - 1)].push_back(event);
+            auto event = parse_event(row, window, catalogs, identifiers);
+            parsed[worker][mix(event.id) & (event_shards - 1)].push_back(event);
         });
     });
     timing.stage("Parse events");
@@ -408,11 +447,10 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
             if (ts < window.start - lookback_ms || ts >= window.end) return;
             const auto campaign = catalogs.campaigns.find(row[2]);
             if (campaign == catalogs.campaigns.end()) return;
-            const Text user = links.canonical(row[1]);
-            const uint64_t hash = TextHash{}(user);
+            const Id user = links.canonical(identifiers.get(row[1]));
             // Identical duplicates have no effect on the latest click or active campaign set.
-            click_parts[worker][hash & (person_shards - 1)].push_back(
-                {{user, hash}, ts, row[0], campaign->second});
+            click_parts[worker][mix(user) & (person_shards - 1)].push_back(
+                {user, ts, identifiers.get(row[0]), campaign->second});
         });
     });
     timing.stage("Parse clicks and resolve user IDs");
@@ -438,7 +476,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         });
         std::sort(clicks[shard].begin(), clicks[shard].end(), [](const Click& a, const Click& b) {
             if (a.user == b.user) {
-                if (a.ts == b.ts) return a.id > b.id;
+                if (a.ts == b.ts) return Identifiers::byte_less(b.id, a.id);
                 return a.ts < b.ts;
             }
             return a.user < b.user;
@@ -459,7 +497,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     const fs::path campaigns_dir = output / "campaign_daily";
     fs::create_directories(users_dir);
     fs::create_directories(campaigns_dir);
-    const auto writers = std::min(threads, person_shards);
+    constexpr size_t writers = 8;
     parallel(writers + 1, threads, [&](size_t part, size_t) {
         if (part == writers) {
             write_campaigns(campaigns_dir / "part-0.parquet", catalogs, campaign_days);

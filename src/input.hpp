@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <system_error>
 #include <vector>
 
+#include <immintrin.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -127,33 +129,102 @@ private:
     std::vector<std::unique_ptr<MappedFile>> files_;
 };
 
-inline bool field(Text value, Text& out) {
-    if (!value.empty() && value.front() == '"') {
-        if (value.size() < 2 || value.back() != '"') return false;
-        value.remove_prefix(1);
-        value.remove_suffix(1);
+// Separate the structural bytes once per 32-byte block. Commas always end
+// fields, and only ASCII LF ends a row under the challenge dialect.
+struct CsvMasks {
+    uint32_t separators;
+    uint32_t newlines;
+    uint32_t quotes;
+};
+
+inline CsvMasks csv_masks(const char* bytes) {
+    const auto low = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes));
+    const auto high = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes + 16));
+    auto mask = [&](char byte) -> uint32_t {
+        const auto needle = _mm_set1_epi8(byte);
+        return static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(low, needle))) |
+               (static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(high, needle))) << 16);
+    };
+    const uint32_t newlines = mask('\n');
+    return {mask(',') | newlines, newlines, mask('"')};
+}
+
+[[gnu::target("avx2")]]
+inline CsvMasks csv_masks_avx2(const char* bytes) {
+    const auto block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes));
+    const auto comma = _mm256_cmpeq_epi8(block, _mm256_set1_epi8(','));
+    const auto newline = _mm256_cmpeq_epi8(block, _mm256_set1_epi8('\n'));
+    const auto quote = _mm256_cmpeq_epi8(block, _mm256_set1_epi8('"'));
+    return {static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(comma, newline))),
+            static_cast<uint32_t>(_mm256_movemask_epi8(newline)),
+            static_cast<uint32_t>(_mm256_movemask_epi8(quote))};
+}
+
+template <size_t N, class Callback, class ReadMasks>
+[[gnu::always_inline]]
+inline void scan_csv(Text bytes, Callback&& callback, ReadMasks read_masks) {
+    if (bytes.empty()) return;
+    const char* field_start = bytes.data();
+    size_t quotes_so_far = 0;
+    size_t count = 0;
+    bool valid = true;
+    std::array<Text, N> fields;
+    const size_t length = bytes.size() + (bytes.back() != '\n');
+    for (size_t offset = 0; offset < length; offset += 32) {
+        const char* block = bytes.data() + offset;
+        std::array<char, 32> tail{};
+        const size_t available = bytes.size() - offset;
+        if (available < 32) {
+            std::memcpy(tail.data(), block, available);
+            if (available + offset < length) tail[available] = '\n';
+        }
+        auto masks = read_masks(available < 32 ? tail.data() : block);
+        while (masks.separators) {
+            const unsigned position = std::countr_zero(masks.separators);
+            const uint32_t bit = uint32_t{1} << position;
+            const uint32_t before = masks.quotes & (bit - 1);
+            const char* end = block + position;
+            const size_t quotes = quotes_so_far + (before ? std::popcount(before) : 0);
+            const size_t size = end - field_start;
+            if (count < N) {
+                if (quotes == 0) {
+                    fields[count] = {field_start, size};
+                } else if (quotes == 2 && size >= 2 && *field_start == '"' && end[-1] == '"') {
+                    fields[count] = {field_start + 1, size - 2};
+                } else {
+                    valid = false;
+                }
+                ++count;
+            } else {
+                valid = false;
+            }
+            if (masks.newlines & bit) {
+                if (valid && count == N) callback(fields);
+                count = 0;
+                valid = true;
+            }
+            field_start = end == bytes.data() + bytes.size() ? end : end + 1;
+            quotes_so_far = 0;
+            masks.quotes ^= before;
+            masks.separators ^= bit;
+        }
+        if (masks.quotes) quotes_so_far += std::popcount(masks.quotes);
     }
-    if (value.find('"') != Text::npos) return false;
-    out = value;
-    return true;
+}
+
+template <size_t N, class Callback>
+[[gnu::target("avx2,popcnt,bmi")]]
+void scan_csv_avx2(Text bytes, Callback&& callback) {
+    scan_csv<N>(bytes, std::forward<Callback>(callback), csv_masks_avx2);
 }
 
 template <size_t N, class Callback>
 void csv_rows(Text bytes, Callback&& callback) {
-    while (!bytes.empty()) {
-        const auto newline = bytes.find('\n');
-        Text line = bytes.substr(0, newline);
-        bytes.remove_prefix(newline == Text::npos ? bytes.size() : newline + 1);
-        std::array<Text, N> fields;
-        size_t count = 0;
-        for (; count < N - 1; ++count) {
-            const auto comma = line.find(',');
-            if (comma == Text::npos || !field(line.substr(0, comma), fields[count])) break;
-            line.remove_prefix(comma + 1);
-        }
-        if (count == N - 1 && line.find(',') == Text::npos && field(line, fields.back())) {
-            callback(fields);
-        }
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt") &&
+        __builtin_cpu_supports("bmi")) {
+        scan_csv_avx2<N>(bytes, std::forward<Callback>(callback));
+    } else {
+        scan_csv<N>(bytes, std::forward<Callback>(callback), csv_masks);
     }
 }
 
@@ -176,26 +247,75 @@ inline int64_t unsigned_value(Text text, int64_t max) {
     return value;
 }
 
+struct Calendar {
+    struct Month {
+        int32_t first_day;
+        int32_t days;
+    };
+    std::array<Month, 10'000 * 12> months;
+
+    Calendar() {
+        using namespace std::chrono;
+        for (int y = 0; y < 10'000; ++y) {
+            for (unsigned m = 1; m <= 12; ++m) {
+                const auto first = sys_days(year(y) / month(m) / day(1));
+                const auto last = (year(y) / month(m) / std::chrono::last).day();
+                months[y * 12 + m - 1] = {static_cast<int32_t>(first.time_since_epoch().count()),
+                                           static_cast<int32_t>(unsigned(last))};
+            }
+        }
+    }
+};
+
+inline const Calendar& calendar() {
+    static const Calendar days;
+    return days;
+}
+
+using DateDigits = std::array<int16_t, 8>;
+
+[[gnu::target("ssse3")]]
+inline DateDigits iso_digits_simd(const char* bytes) {
+    const auto first = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes));
+    const auto last = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes + 4));
+    const auto from_first = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1);
+    const auto from_last = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 13, 14, -1, -1);
+    const auto ascii = _mm_or_si128(_mm_shuffle_epi8(first, from_first),
+                                   _mm_shuffle_epi8(last, from_last));
+    const auto digits = _mm_sub_epi8(ascii, _mm_set1_epi8('0'));
+    const auto invalid = _mm_or_si128(_mm_cmpgt_epi8(digits, _mm_set1_epi8(9)),
+                                     _mm_cmpgt_epi8(_mm_setzero_si128(), digits));
+    if ((_mm_movemask_epi8(invalid) & 0x3fff) != 0) return {-1};
+    const auto numbers = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+    DateDigits result;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(result.data()), numbers);
+    return result;
+}
+
+inline DateDigits iso_digits(const char* bytes) {
+    if (__builtin_cpu_supports("ssse3")) return iso_digits_simd(bytes);
+    return {static_cast<int16_t>(two_digits(bytes)),
+            static_cast<int16_t>(two_digits(bytes + 2)),
+            static_cast<int16_t>(two_digits(bytes + 5)),
+            static_cast<int16_t>(two_digits(bytes + 8)),
+            static_cast<int16_t>(two_digits(bytes + 11)),
+            static_cast<int16_t>(two_digits(bytes + 14)),
+            static_cast<int16_t>(two_digits(bytes + 17))};
+}
+
 inline int64_t iso_timestamp(Text text) {
-    using namespace std::chrono;
     if ((text.size() != 20 && text.size() != 25) || text[4] != '-' || text[7] != '-' ||
         text[10] != 'T' || text[13] != ':' || text[16] != ':') {
         return invalid_ts;
     }
     const char* p = text.data();
-    const int century = two_digits(p);
-    const int decade = two_digits(p + 2);
-    const int mm = two_digits(p + 5);
-    const int dd = two_digits(p + 8);
-    const int hh = two_digits(p + 11);
-    const int min = two_digits(p + 14);
-    const int sec = two_digits(p + 17);
-    if (century < 0 || decade < 0 || mm < 1 || dd < 1 ||
+    const auto [century, decade, mm, dd, hh, min, sec, unused] = iso_digits(p);
+    if (century < 0 || decade < 0 || mm < 1 || mm > 12 || dd < 1 ||
         hh < 0 || hh > 23 || min < 0 || min > 59 || sec < 0 || sec > 59) {
         return invalid_ts;
     }
-    const year_month_day date{year(century * 100 + decade), month(mm), day(dd)};
-    if (!date.ok()) return invalid_ts;
+    const auto& month = calendar().months[(century * 100 + decade) * 12 + mm - 1];
+    if (dd > month.days) return invalid_ts;
     int offset = 0;
     if (text.size() == 20) {
         if (p[19] != 'Z') return invalid_ts;
@@ -206,7 +326,7 @@ inline int64_t iso_timestamp(Text text) {
         if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return invalid_ts;
         offset = (hours * 60 + minutes) * (p[19] == '+' ? 1 : -1);
     }
-    return sys_days(date).time_since_epoch().count() * day_ms +
+    return (month.first_day + dd - 1) * day_ms +
            ((hh * 60 + min - offset) * 60 + sec) * 1000;
 }
 

@@ -4,3 +4,4 @@
 !src/**
 !scripts/
 !scripts/build.sh
+!requirements-build.txt

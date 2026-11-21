@@ -1,5 +1,6 @@
 #pragma once
 
+#include "identifiers.hpp"
 #include "input.hpp"
 
 #include <arrow/api.h>
@@ -10,7 +11,7 @@
 namespace shopping {
 
 struct UserDay {
-    Text user;
+    Id user;
     int32_t day;
     int64_t sessions;
     int64_t events;
@@ -94,13 +95,15 @@ inline void write_users(const fs::path& path, const std::vector<UserDay>& rows) 
     size_t id_bytes = 0;
     size_t category_bytes = 0;
     for (const auto& row : rows) {
-        id_bytes += row.user.size();
+        std::array<char, 9> id;
+        id_bytes += Identifiers::decode(row.user, id).size();
         category_bytes += row.category.size();
     }
     check(user.ReserveData(id_bytes));
     check(category.ReserveData(category_bytes));
     for (const auto& row : rows) {
-        user.UnsafeAppend(row.user);
+        std::array<char, 9> id;
+        user.UnsafeAppend(Identifiers::decode(row.user, id));
         day.UnsafeAppend(row.day);
         sessions.UnsafeAppend(row.sessions);
         events.UnsafeAppend(row.events);
