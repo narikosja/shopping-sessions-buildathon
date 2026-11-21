@@ -1,0 +1,10 @@
+/shopping-sessions
+/.venv/
+/dev/
+/dev-answer/
+/fixtures/
+/out/
+/bench/
+/build/
+__pycache__/
+*.zip
