@@ -129,15 +129,16 @@ private:
     std::vector<std::unique_ptr<MappedFile>> files_;
 };
 
-// Separate the structural bytes once per 32-byte block. Commas always end
+// Separate the structural bytes once per vector block. Commas always end
 // fields, and only ASCII LF ends a row under the challenge dialect.
+template <class Bits>
 struct CsvMasks {
-    uint32_t separators;
-    uint32_t newlines;
-    uint32_t quotes;
+    Bits separators;
+    Bits newlines;
+    Bits quotes;
 };
 
-inline CsvMasks csv_masks(const char* bytes) {
+inline CsvMasks<uint32_t> csv_masks(const char* bytes) {
     const auto low = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes));
     const auto high = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes + 16));
     auto mask = [&](char byte) -> uint32_t {
@@ -150,7 +151,7 @@ inline CsvMasks csv_masks(const char* bytes) {
 }
 
 [[gnu::target("avx2")]]
-inline CsvMasks csv_masks_avx2(const char* bytes) {
+inline CsvMasks<uint32_t> csv_masks_avx2(const char* bytes) {
     const auto block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes));
     const auto comma = _mm256_cmpeq_epi8(block, _mm256_set1_epi8(','));
     const auto newline = _mm256_cmpeq_epi8(block, _mm256_set1_epi8('\n'));
@@ -160,7 +161,16 @@ inline CsvMasks csv_masks_avx2(const char* bytes) {
             static_cast<uint32_t>(_mm256_movemask_epi8(quote))};
 }
 
-template <size_t N, class Callback, class ReadMasks>
+[[gnu::target("avx512bw")]]
+inline CsvMasks<uint64_t> csv_masks_avx512(const char* bytes) {
+    const auto block = _mm512_loadu_si512(bytes);
+    const uint64_t comma = _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8(','));
+    const uint64_t newline = _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8('\n'));
+    const uint64_t quote = _mm512_cmpeq_epi8_mask(block, _mm512_set1_epi8('"'));
+    return {comma | newline, newline, quote};
+}
+
+template <size_t N, size_t Width, class Callback, class ReadMasks>
 [[gnu::always_inline]]
 inline void scan_csv(Text bytes, Callback&& callback, ReadMasks read_masks) {
     if (bytes.empty()) return;
@@ -170,19 +180,20 @@ inline void scan_csv(Text bytes, Callback&& callback, ReadMasks read_masks) {
     bool valid = true;
     std::array<Text, N> fields;
     const size_t length = bytes.size() + (bytes.back() != '\n');
-    for (size_t offset = 0; offset < length; offset += 32) {
+    std::array<char, Width> tail{};
+    for (size_t offset = 0; offset < length; offset += Width) {
         const char* block = bytes.data() + offset;
-        std::array<char, 32> tail{};
         const size_t available = bytes.size() - offset;
-        if (available < 32) {
+        if (available < Width) {
             std::memcpy(tail.data(), block, available);
             if (available + offset < length) tail[available] = '\n';
         }
-        auto masks = read_masks(available < 32 ? tail.data() : block);
+        auto masks = read_masks(available < Width ? tail.data() : block);
+        using Bits = decltype(masks.separators);
         while (masks.separators) {
             const unsigned position = std::countr_zero(masks.separators);
-            const uint32_t bit = uint32_t{1} << position;
-            const uint32_t before = masks.quotes & (bit - 1);
+            const Bits bit = Bits{1} << position;
+            const Bits before = masks.quotes & (bit - 1);
             const char* end = block + position;
             const size_t quotes = quotes_so_far + (before ? std::popcount(before) : 0);
             const size_t size = end - field_start;
@@ -215,16 +226,24 @@ inline void scan_csv(Text bytes, Callback&& callback, ReadMasks read_masks) {
 template <size_t N, class Callback>
 [[gnu::target("avx2,popcnt,bmi")]]
 void scan_csv_avx2(Text bytes, Callback&& callback) {
-    scan_csv<N>(bytes, std::forward<Callback>(callback), csv_masks_avx2);
+    scan_csv<N, 32>(bytes, std::forward<Callback>(callback), csv_masks_avx2);
+}
+
+template <size_t N, class Callback>
+[[gnu::target("avx512bw,popcnt,bmi")]]
+void scan_csv_avx512(Text bytes, Callback&& callback) {
+    scan_csv<N, 64>(bytes, std::forward<Callback>(callback), csv_masks_avx512);
 }
 
 template <size_t N, class Callback>
 void csv_rows(Text bytes, Callback&& callback) {
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt") &&
-        __builtin_cpu_supports("bmi")) {
+    const bool bit_ops = __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("bmi");
+    if (bit_ops && __builtin_cpu_supports("avx512bw")) {
+        scan_csv_avx512<N>(bytes, std::forward<Callback>(callback));
+    } else if (bit_ops && __builtin_cpu_supports("avx2")) {
         scan_csv_avx2<N>(bytes, std::forward<Callback>(callback));
     } else {
-        scan_csv<N>(bytes, std::forward<Callback>(callback), csv_masks);
+        scan_csv<N, 32>(bytes, std::forward<Callback>(callback), csv_masks);
     }
 }
 
@@ -330,7 +349,31 @@ inline int64_t iso_timestamp(Text text) {
            ((hh * 60 + min - offset) * 60 + sec) * 1000;
 }
 
+// Parse the common 13-digit epoch form with parallel decimal reductions.
+inline int64_t epoch_thirteen(const char* bytes) {
+    uint64_t first;
+    uint32_t middle;
+    std::memcpy(&first, bytes, sizeof(first));
+    std::memcpy(&middle, bytes + 8, sizeof(middle));
+    const unsigned last = static_cast<unsigned char>(bytes[12]) - '0';
+    if (((first | (first + 0x4646464646464646ULL) |
+          (first - 0x3030303030303030ULL)) & 0x8080808080808080ULL) ||
+        ((middle | (middle + 0x46464646U) |
+          (middle - 0x30303030U)) & 0x80808080U) || last > 9) {
+        return invalid_ts;
+    }
+    first &= 0x0f0f0f0f0f0f0f0fULL;
+    first = (first * 10 + (first >> 8)) & 0x00ff00ff00ff00ffULL;
+    first = (first * 100 + (first >> 16)) & 0x0000ffff0000ffffULL;
+    const uint32_t prefix = static_cast<uint32_t>(first * 10'000 + (first >> 32));
+    middle &= 0x0f0f0f0fU;
+    middle = (middle * 10 + (middle >> 8)) & 0x00ff00ffU;
+    const uint32_t suffix = (middle * 100 + (middle >> 16)) & 0x0000ffffU;
+    return static_cast<int64_t>(prefix) * 100'000 + suffix * 10 + last;
+}
+
 inline int64_t timestamp(Text text) {
+    if (text.size() == 13) return epoch_thirteen(text.data());
     if ((text.size() == 20 || text.size() == 25) && text[4] == '-') {
         return iso_timestamp(text);
     }

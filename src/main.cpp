@@ -157,20 +157,45 @@ struct Catalogs {
     }
 };
 
-struct EventCandidate {
-    Id id;
-    Id user = 0;
-    int64_t ingest;
-    int64_t ts = 0;
-    int32_t price = 0;
-    uint32_t category = 0;
+struct CompactEventData {
+    uint32_t time = 0;
+    uint32_t purchase = 0;
+    static constexpr uint32_t price_mask = (1u << 24) - 1;
+
+    CompactEventData() = default;
+    CompactEventData(int64_t ts, uint32_t price, uint32_t category, int64_t origin)
+        : time(static_cast<uint32_t>(ts - origin)), purchase(price | (category << 24)) {}
+
+    int64_t timestamp(int64_t origin) const { return origin + time; }
+    uint32_t price() const { return purchase & price_mask; }
+    uint32_t category() const { return purchase >> 24; }
 };
 
+struct WideEventData {
+    int64_t time = 0;
+    uint32_t cents = 0;
+    uint32_t category_id = 0;
+
+    WideEventData() = default;
+    WideEventData(int64_t ts, uint32_t price, uint32_t category, int64_t)
+        : time(ts), cents(price), category_id(category) {}
+
+    int64_t timestamp(int64_t) const { return time; }
+    uint32_t price() const { return cents; }
+    uint32_t category() const { return category_id; }
+};
+
+template <class Data>
 struct Event {
-    Id user;
-    int64_t ts;
-    int32_t price;
-    uint32_t category;
+    Id user = 0;
+    Data data;
+};
+
+template <class Data>
+struct EventCandidate {
+    Id id;
+    int64_t ingest;
+    Event<Data> event;
 };
 
 struct Click {
@@ -180,32 +205,38 @@ struct Click {
     uint32_t campaign;
 };
 
-EventCandidate parse_event(const std::array<Text, 7>& row, const Window& window,
+template <class Data>
+EventCandidate<Data> parse_event(const std::array<Text, 7>& row, const Window& window,
                            const Catalogs& catalogs, Identifiers& identifiers) {
-    EventCandidate event{identifiers.get(row[0]), 0, iso_timestamp(row[3])};
+    EventCandidate<Data> event{identifiers.get(row[0]), iso_timestamp(row[3]), {}};
+    uint32_t cents = 0;
+    uint32_t category = 0;
     if (row[1].empty() || row[5].empty()) return event;
-    event.ts = timestamp(row[2]);
-    if (event.ts < window.start || event.ts >= window.end || event.ingest - event.ts > day_ms) {
+    const int64_t ts = timestamp(row[2]);
+    if (ts < window.start || ts >= window.end || event.ingest - ts > day_ms) {
         return event;
     }
     if (row[4] == "purchase") {
         const int64_t price = unsigned_value(row[6], 10'000'000);
         if (price < 1) return event;
-        event.price = static_cast<int32_t>(price);
+        cents = static_cast<uint32_t>(price);
         const auto product = catalogs.products.find(row[5]);
-        if (product != catalogs.products.end()) event.category = product->second;
+        if (product != catalogs.products.end()) category = product->second;
     } else if (row[4] != "view" && row[4] != "cart") {
         return event;
     }
-    event.user = identifiers.get(row[1]);
+    event.event = {identifiers.get(row[1]), Data(ts, cents, category, window.start)};
     return event;
 }
 
-using EventInput = std::array<std::vector<EventCandidate>, event_shards>;
-using EventPartitions = std::array<std::vector<Event>, person_shards>;
+template <class Data>
+using EventInput = std::array<std::vector<EventCandidate<Data>>, event_shards>;
+template <class Data>
+using EventPartitions = std::array<std::vector<Event<Data>>, person_shards>;
 using ClickPartitions = std::array<std::vector<Click>, person_shards>;
 
-void deduplicate(size_t shard, std::vector<EventInput>& inputs, EventPartitions& output,
+template <class Data>
+void deduplicate(size_t shard, std::vector<EventInput<Data>>& inputs, EventPartitions<Data>& output,
                  const Links& links) {
     size_t count = 0;
     for (const auto& input : inputs) count += input[shard].size();
@@ -213,7 +244,7 @@ void deduplicate(size_t shard, std::vector<EventInput>& inputs, EventPartitions&
     if (count == 0) return;
     struct Slot {
         Id id = 0;
-        EventCandidate* row = nullptr;
+        EventCandidate<Data>* row = nullptr;
     };
     std::vector<Slot> slots(std::bit_ceil(count + count / 2 + 1));
     const size_t mask = slots.size() - 1;
@@ -225,20 +256,20 @@ void deduplicate(size_t shard, std::vector<EventInput>& inputs, EventPartitions&
             if (!slot.id) {
                 slot = {row.id, &row};
             } else if (row.ingest < slot.row->ingest) {
-                slot.row->user = 0;
+                slot.row->event.user = 0;
                 slot.row = &row;
             } else {
-                row.user = 0;
+                row.event.user = 0;
             }
         }
     }
     for (auto& input : inputs) {
         for (const auto& row : input[shard]) {
-            if (!row.user) continue;
-            const Id person = links.canonical(row.user);
-            output[mix(person) & (person_shards - 1)].push_back({person, row.ts, row.price, row.category});
+            if (!row.event.user) continue;
+            const Id person = links.canonical(row.event.user);
+            output[mix(person) & (person_shards - 1)].push_back({person, row.event.data});
         }
-        std::vector<EventCandidate>().swap(input[shard]);
+        std::vector<EventCandidate<Data>>().swap(input[shard]);
     }
 }
 
@@ -275,8 +306,10 @@ private:
     std::vector<Entry> entries_;
 };
 
-void aggregate(const std::vector<Event>& events, const std::vector<Click>& clicks,
-               const Catalogs& catalogs, std::vector<UserDay>& users, DailyCampaigns& campaign_days) {
+template <class Data>
+void aggregate(const std::vector<Event<Data>>& events, const std::vector<Click>& clicks,
+               const Catalogs& catalogs, std::vector<UserDay>& users, DailyCampaigns& campaign_days,
+               int64_t origin) {
     const size_t campaign_count = catalogs.campaign_rows.size();
     ActiveCampaigns campaigns(campaign_count);
     std::vector<int64_t> category_revenue(catalogs.categories.size());
@@ -289,24 +322,26 @@ void aggregate(const std::vector<Event>& events, const std::vector<Click>& click
         size_t oldest = click;
 
         do {
-            const int32_t day = utc_day(events[event].ts);
+            const int32_t day = utc_day(events[event].data.timestamp(origin));
             UserDay row{user, day, 0, 0, 0, {}};
             auto& daily = campaign_days.try_emplace(day, campaign_count).first->second;
             do {
-                const auto start = events[event].ts;
+                const auto start = events[event].data.timestamp(origin);
                 const size_t first = event;
                 int64_t revenue = 0;
                 int64_t last = start;
                 do {
                     const auto& item = events[event++];
-                    last = item.ts;
-                    if (item.price != 0) {
-                        revenue += item.price;
-                        if (category_revenue[item.category] == 0) purchased.push_back(item.category);
-                        category_revenue[item.category] += item.price;
+                    last = item.data.timestamp(origin);
+                    const auto price = item.data.price();
+                    if (price != 0) {
+                        const auto category = item.data.category();
+                        revenue += price;
+                        if (category_revenue[category] == 0) purchased.push_back(category);
+                        category_revenue[category] += price;
                     }
                 } while (event < events.size() && events[event].user == user &&
-                         events[event].ts - last <= gap_ms);
+                         events[event].data.timestamp(origin) - last <= gap_ms);
 
                 row.sessions++;
                 row.events += event - first;
@@ -325,7 +360,7 @@ void aggregate(const std::vector<Event>& events, const std::vector<Click>& click
                 credit.revenue += revenue;
                 for (uint32_t campaign : campaigns.active) daily[campaign].assists++;
             } while (event < events.size() && events[event].user == user &&
-                     utc_day(events[event].ts) == day);
+                     utc_day(events[event].data.timestamp(origin)) == day);
 
             int64_t highest = 0;
             for (uint32_t category : purchased) {
@@ -405,18 +440,12 @@ private:
     Clock::time_point last_ = Clock::now();
 };
 
-void run(const fs::path& data, const fs::path& output, size_t threads) {
-    Timings timing;
-    Inputs inputs;
-    const Window window = read_window(data / "manifest.json");
-    const Catalogs catalogs(inputs.load(data / "products.csv"), inputs.load(data / "campaigns.csv"));
-    Identifiers identifiers;
-    const Links links(inputs.chunks(data / "links"), identifiers);
-    const auto event_chunks = inputs.chunks(data / "events");
-    const auto click_chunks = inputs.chunks(data / "clicks");
-    timing.stage("Catalogs and identity links");
-
-    std::vector<EventInput> parsed(threads);
+template <class Data>
+void process(const Window& window, const Catalogs& catalogs, const Links& links,
+             Identifiers& identifiers, const std::vector<Text>& event_chunks,
+             const std::vector<Text>& click_chunks, const fs::path& output, size_t threads,
+             Timings& timing) {
+    std::vector<EventInput<Data>> parsed(threads);
     size_t event_bytes = 0;
     for (const auto& chunk : event_chunks) event_bytes += chunk.size();
     const size_t initial_capacity = event_bytes / 68 / event_shards / threads;
@@ -426,13 +455,13 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     parallel(event_chunks.size(), threads, [&](size_t chunk, size_t worker) {
         csv_rows<7>(event_chunks[chunk], [&](const auto& row) {
             if (row[0].empty()) return;
-            auto event = parse_event(row, window, catalogs, identifiers);
+            auto event = parse_event<Data>(row, window, catalogs, identifiers);
             parsed[worker][mix(event.id) & (event_shards - 1)].push_back(event);
         });
     });
     timing.stage("Parse events");
 
-    std::vector<EventPartitions> partitioned(threads);
+    std::vector<EventPartitions<Data>> partitioned(threads);
     parallel(event_shards, threads, [&](size_t shard, size_t worker) {
         deduplicate(shard, parsed, partitioned[worker], links);
     });
@@ -455,7 +484,7 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     });
     timing.stage("Parse clicks and resolve user IDs");
 
-    EventPartitions events;
+    EventPartitions<Data> events;
     ClickPartitions clicks;
     parallel(person_shards, threads, [&](size_t shard, size_t) {
         auto gather = [shard](auto& parts, auto& rows) {
@@ -470,8 +499,8 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         };
         gather(partitioned, events[shard]);
         gather(click_parts, clicks[shard]);
-        std::sort(events[shard].begin(), events[shard].end(), [](const Event& a, const Event& b) {
-            if (a.user == b.user) return a.ts < b.ts;
+        std::sort(events[shard].begin(), events[shard].end(), [](const Event<Data>& a, const Event<Data>& b) {
+            if (a.user == b.user) return a.data.time < b.data.time;
             return a.user < b.user;
         });
         std::sort(clicks[shard].begin(), clicks[shard].end(), [](const Click& a, const Click& b) {
@@ -487,8 +516,8 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
     std::array<std::vector<UserDay>, person_shards> user_days;
     std::array<DailyCampaigns, person_shards> campaign_days;
     parallel(person_shards, threads, [&](size_t shard, size_t) {
-        aggregate(events[shard], clicks[shard], catalogs, user_days[shard], campaign_days[shard]);
-        std::vector<Event>().swap(events[shard]);
+        aggregate(events[shard], clicks[shard], catalogs, user_days[shard], campaign_days[shard], window.start);
+        std::vector<Event<Data>>().swap(events[shard]);
         std::vector<Click>().swap(clicks[shard]);
     });
     timing.stage("Sessionize, attribute and aggregate");
@@ -515,6 +544,29 @@ void run(const fs::path& data, const fs::path& output, size_t threads) {
         write_users(users_dir / ("part-" + std::to_string(part) + ".parquet"), rows);
     });
     timing.stage("Write Parquet outputs");
+}
+
+void run(const fs::path& data, const fs::path& output, size_t threads) {
+    Timings timing;
+    Inputs inputs;
+    const Window window = read_window(data / "manifest.json");
+    const Catalogs catalogs(inputs.load(data / "products.csv"), inputs.load(data / "campaigns.csv"));
+    Identifiers identifiers;
+    const Links links(inputs.chunks(data / "links"), identifiers);
+    const auto event_chunks = inputs.chunks(data / "events");
+    const auto click_chunks = inputs.chunks(data / "clicks");
+    timing.stage("Catalogs and identity links");
+
+    // With the official 14-day window, relative millisecond timestamps and
+    // the catalog's category indices fit in 8 bytes. Wide datasets use the same pipeline.
+    if (window.end - window.start <= std::numeric_limits<uint32_t>::max() &&
+        catalogs.categories.size() <= 256) {
+        process<CompactEventData>(window, catalogs, links, identifiers, event_chunks,
+                                  click_chunks, output, threads, timing);
+    } else {
+        process<WideEventData>(window, catalogs, links, identifiers, event_chunks,
+                               click_chunks, output, threads, timing);
+    }
 }
 
 }  // namespace shopping
