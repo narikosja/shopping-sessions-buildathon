@@ -48,5 +48,6 @@ The local Docker measurements used two vCPUs and 8 GiB of memory. Times are medi
 | --- | ---: | --- |
 | Official development dataset, 1 million events | 0.348 s | Both tables match the official development answers |
 | Generator seed 27183, 20 million events | 4.221 s | Both tables match the baseline implementation |
+| Generator seed 27183, 60 million events | 18.932 s | Both tables match the baseline implementation |
 
-The practice-size median was 5.667 seconds before this optimization. The official scorer uses hidden workloads and eight pinned vCPUs.
+The practice-size median was 5.667 seconds before this optimization. The 60-million-event input was 5.66 GB. One CSV shard was mounted from RAM to fit the dataset and Docker writable layers in the local workspace. The official scorer uses hidden workloads and eight pinned vCPUs.
